@@ -1,5 +1,4 @@
 use color_eyre::eyre::Context;
-use cosmic_greeter_daemon::{UserData, UserFilter};
 use std::error::Error;
 use std::ffi::CString;
 use std::future::pending;
@@ -71,20 +70,10 @@ struct GreeterProxy;
 #[zbus::interface(name = "com.system76.CosmicGreeter")]
 impl GreeterProxy {
     async fn get_user_data(&mut self) -> Result<String, GreeterError> {
-        let user_filter = UserFilter::new().await;
-
-        // The pwd::Passwd method is unsafe (but not labelled as such) due to using global state (libc pwent functions).
-        // To prevent issues, this should only be called once in the entire process space at a time
-        let users: Vec<_> = /* unsafe */ {
-             pwd::Passwd::iter()
-                .filter(|user| user_filter.filter(user))
-                .collect()
-            };
+        let users = cosmic_greeter_daemon::load_users().await;
 
         let mut user_datas = Vec::new();
-        for user in users {
-            let mut user_data = UserData::from(user.clone());
-
+        for (user, mut user_data) in users {
             //IMPORTANT: Assume the identity of the user to ensure we don't read user file data as root
             run_as_user(&user, || user_data.load_config_as_user())
                 .map_err(|err| GreeterError::RunAsUser(err.to_string()))?;

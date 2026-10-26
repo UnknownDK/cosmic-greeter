@@ -31,7 +31,7 @@ use cosmic::surface::action::{LiveSettings, app_layer_shell};
 use cosmic::widget::{id_container, text};
 use cosmic::{Element, executor, surface, theme, widget};
 use cosmic_greeter_config::Config as CosmicGreeterConfig;
-use cosmic_greeter_daemon::{UserData, UserFilter};
+use cosmic_greeter_daemon::UserData;
 use cosmic_randr_shell::{KdlParseWithError, List};
 use cosmic_settings_a11y_manager_subscription::{AccessibilityEvent, AccessibilityRequest};
 use greetd_ipc::Request;
@@ -79,16 +79,11 @@ async fn user_data_dbus() -> Result<Vec<UserData>, Box<dyn Error>> {
 }
 
 async fn user_data_fallback() -> Vec<UserData> {
-    let user_filter = UserFilter::new().await;
-
-    // The pwd::Passwd method is unsafe (but not labelled as such) due to using global state (libc pwent functions).
-    /* unsafe */
-    {
-        pwd::Passwd::iter()
-            .filter(|user| user_filter.filter(user))
-            .map(UserData::from)
-            .collect()
-    }
+    cosmic_greeter_daemon::load_users()
+        .await
+        .into_iter()
+        .map(|(_, user_data)| user_data)
+        .collect()
 }
 
 pub fn main() -> Result<(), Box<dyn Error>> {

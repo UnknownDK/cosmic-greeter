@@ -14,9 +14,164 @@ pub use cosmic_bg_config::{Color, Source as BgSource};
 pub use cosmic_comp_config::{CosmicCompConfig, XkbConfig, ZoomConfig};
 pub use cosmic_theme::{Theme, ThemeBuilder};
 
+pub mod accounts;
+
+/// Accounts that are never shown, matching the AccountsService defaults
+const EXCLUDED_USERNAMES: &[&str] = &[
+    "bin",
+    "root",
+    "daemon",
+    "adm",
+    "lp",
+    "sync",
+    "shutdown",
+    "halt",
+    "mail",
+    "news",
+    "uucp",
+    "nobody",
+    "postgres",
+    "pvm",
+    "rpm",
+    "nfsnobody",
+    "pcap",
+    "mysql",
+    "ftp",
+    "games",
+    "man",
+    "at",
+    "gdm",
+    "lightdm",
+    "gnome-initial-setup",
+    "git",
+    "greetd",
+    "cosmic-greeter",
+];
+
+/// Decides whether an account belongs to a human, using the same rules as AccountsService.
+/// There is deliberately no upper UID bound: UID_MAX only limits the UIDs useradd allocates,
+/// while directory services (SSSD, winbind) map users to UIDs far above it.
+fn is_human(
+    uid: u32,
+    name: &str,
+    shell: &str,
+    uid_min: u32,
+    valid_shells: Option<&BTreeSet<String>>,
+) -> bool {
+    if EXCLUDED_USERNAMES.contains(&name) {
+        return false;
+    }
+
+    match Path::new(shell).file_name().and_then(|x| x.to_str()) {
+        // Skip empty shell
+        None => return false,
+        // Skip shell ending in false
+        Some("false") => return false,
+        // Skip shell ending in nologin
+        Some("nologin") => return false,
+        _ => {}
+    }
+
+    // Skip shells that are not listed in /etc/shells
+    if valid_shells.is_some_and(|shells| !shells.contains(shell)) {
+        return false;
+    }
+
+    uid >= uid_min
+}
+
+/// Reads /etc/passwd directly instead of enumerating NSS, so that directory services with
+/// enumeration enabled do not list every domain account.
+fn local_passwd_users() -> Vec<pwd::Passwd> {
+    let data = match fs::read_to_string("/etc/passwd") {
+        Ok(data) => data,
+        Err(err) => {
+            tracing::error!("failed to read /etc/passwd: {err:?}");
+            return Vec::new();
+        }
+    };
+
+    data.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            let [name, passwd, uid, gid, gecos, dir, shell] = fields[..] else {
+                return None;
+            };
+            Some(pwd::Passwd {
+                name: name.to_string(),
+                passwd: Some(passwd.to_string()),
+                uid: uid.parse().ok()?,
+                gid: gid.parse().ok()?,
+                gecos: Some(gecos.to_string()),
+                dir: dir.to_string(),
+                shell: shell.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Loads the users to show on the login screen, from AccountsService when available and from
+/// /etc/passwd otherwise. systemd-homed users are added in both cases, as older AccountsService
+/// versions do not list them.
+pub async fn load_users() -> Vec<(pwd::Passwd, UserData)> {
+    let user_filter = UserFilter::new().await;
+
+    let accounts_users = match Connection::system().await {
+        Ok(connection) => accounts::list_users(&connection).await,
+        Err(err) => Err(err),
+    };
+
+    // The pwd::Passwd methods are unsafe (but not labelled as such) due to using global state (libc pwent functions).
+    // To prevent issues, this should only be called once in the entire process space at a time
+    let mut users: Vec<(pwd::Passwd, UserData)> = match accounts_users {
+        Ok(accounts_users) => accounts_users
+            .into_iter()
+            .filter_map(
+                |accounts_user| match pwd::Passwd::from_name(&accounts_user.name) {
+                    Ok(Some(user)) => {
+                        Some((user.clone(), UserData::from_accounts(user, accounts_user)))
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "user {:?} from AccountsService not found",
+                            accounts_user.name
+                        );
+                        None
+                    }
+                    Err(err) => {
+                        tracing::warn!("failed to look up user {:?}: {err:?}", accounts_user.name);
+                        None
+                    }
+                },
+            )
+            .collect(),
+        Err(err) => {
+            tracing::warn!("failed to list users from AccountsService, using /etc/passwd: {err:?}");
+            local_passwd_users()
+                .into_iter()
+                .filter(|user| user_filter.filter(user))
+                .map(|user| (user.clone(), UserData::from(user)))
+                .collect()
+        }
+    };
+
+    for uid in user_filter.homed_uids.iter() {
+        if users.iter().any(|(user, _)| user.uid == *uid) {
+            continue;
+        }
+        if let Some(user) = pwd::Passwd::from_uid(*uid)
+            && user_filter.filter(&user)
+        {
+            users.push((user.clone(), UserData::from(user)));
+        }
+    }
+
+    users
+}
+
 pub struct UserFilter {
     uid_min: u32,
-    uid_max: u32,
+    valid_shells: Option<BTreeSet<String>>,
     homed_uids: BTreeSet<u32>,
 }
 
@@ -52,34 +207,39 @@ impl UserFilter {
         #[cfg(not(feature = "systemd"))]
         let homed_uids = BTreeSet::new();
 
+        // Without /etc/shells, only the false and nologin checks apply
+        let valid_shells = fs::read_to_string("/etc/shells").ok().map(|data| {
+            data.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        });
+
         Self {
             uid_min: login_defs
                 .get("UID_MIN")
                 .and_then(|x| x.parse::<u32>().ok())
                 .unwrap_or(1000),
-            uid_max: login_defs
-                .get("UID_MAX")
-                .and_then(|x| x.parse::<u32>().ok())
-                .unwrap_or(65000),
+            valid_shells,
             homed_uids,
         }
     }
 
     pub fn filter(&self, user: &pwd::Passwd) -> bool {
-        if (user.uid < self.uid_min || user.uid > self.uid_max)
-            && !self.homed_uids.contains(&user.uid)
-        {
-            // Skip system accounts
-            return false;
-        }
-
-        match Path::new(&user.shell).file_name().and_then(|x| x.to_str()) {
-            // Skip shell ending in false
-            Some("false") => false,
-            // Skip shell ending in nologin
-            Some("nologin") => false,
-            _ => true,
-        }
+        // systemd-homed allocates UIDs from its own range, which may be below UID_MIN
+        let uid_min = if self.homed_uids.contains(&user.uid) {
+            0
+        } else {
+            self.uid_min
+        };
+        is_human(
+            user.uid,
+            &user.name,
+            &user.shell,
+            uid_min,
+            self.valid_shells.as_ref(),
+        )
     }
 }
 
@@ -88,6 +248,9 @@ pub struct UserData {
     pub uid: u32,
     pub name: String,
     pub full_name: String,
+    /// Avatar path from AccountsService, only used by the daemon to load `icon_opt`
+    #[serde(skip)]
+    pub icon_file_opt: Option<PathBuf>,
     pub icon_opt: Option<Vec<u8>>,
     pub theme_opt: Option<Theme>,
     pub theme_builder_opt: Option<ThemeBuilder>,
@@ -129,26 +292,32 @@ impl UserData {
     }
 
     fn load_icon_as_user(&mut self) {
-        //TODO: use accountsservice?
-        let icon_paths = [
-            //IMPORTANT: This file is owned by root and safe to read (it won't be a link to /etc/shadow for example)
-            // It may not exist if the user uses one of the system icons. In that case, we should read the
-            // information in /var/lib/AccountsService/users, and then read the icon path as the user
+        let icon_paths = self.icon_file_opt.iter().cloned().chain([
+            // Avatar set through AccountsService, used when AccountsService is unavailable
             Path::new("/var/lib/AccountsService/icons").join(&self.name),
             // systemd-homed cache
             Path::new("/var/cache/systemd/home")
                 .join(&self.name)
                 .join("avatar"),
-        ];
+        ]);
 
         for icon_path in icon_paths {
+            //IMPORTANT: This runs with the identity of the user, so a user controlled icon path
+            // (like ~/.face) cannot be used to read files the user has no access to
             match fs::OpenOptions::new()
                 .read(true)
-                // Do not follow symlinks
-                .custom_flags(libc::O_NOFOLLOW)
+                // Do not follow symlinks, and do not block on a FIFO
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(&icon_path)
             {
                 Ok(mut icon_file) => {
+                    if !icon_file
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.is_file())
+                    {
+                        tracing::warn!("icon {:?} is not a regular file", icon_path);
+                        continue;
+                    }
                     let mut icon_data = Vec::new();
                     match icon_file.read_to_end(&mut icon_data) {
                         Ok(count) => {
@@ -334,5 +503,83 @@ impl From<pwd::Passwd> for UserData {
             full_name,
             ..Default::default()
         }
+    }
+}
+
+impl UserData {
+    fn from_accounts(user: pwd::Passwd, accounts_user: accounts::User) -> Self {
+        let mut user_data = Self::from(user);
+        if !accounts_user.real_name.is_empty() {
+            user_data.full_name = accounts_user.real_name;
+        }
+        if !accounts_user.icon_file.is_empty() {
+            user_data.icon_file_opt = Some(PathBuf::from(accounts_user.icon_file));
+        }
+        user_data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shells() -> BTreeSet<String> {
+        ["/bin/sh", "/bin/bash", "/usr/bin/bash", "/usr/bin/fish"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn domain_uids_above_uid_max_are_human() {
+        assert!(is_human(
+            1_234_500_001,
+            "jdoe@corp.example",
+            "/bin/bash",
+            1000,
+            Some(&shells())
+        ));
+        assert!(is_human(65_001, "jdoe", "/bin/bash", 1000, Some(&shells())));
+    }
+
+    #[test]
+    fn uids_below_uid_min_are_not_human() {
+        assert!(!is_human(
+            999,
+            "service",
+            "/bin/bash",
+            1000,
+            Some(&shells())
+        ));
+        assert!(is_human(1000, "user", "/bin/bash", 1000, Some(&shells())));
+    }
+
+    #[test]
+    fn excluded_usernames_are_not_human() {
+        // The overflow UID is no longer hidden by an upper UID bound
+        assert!(!is_human(
+            65_534,
+            "nobody",
+            "/bin/sh",
+            1000,
+            Some(&shells())
+        ));
+        assert!(!is_human(65_534, "nfsnobody", "/bin/sh", 1000, None));
+        assert!(!is_human(1001, "cosmic-greeter", "/bin/sh", 1000, None));
+    }
+
+    #[test]
+    fn invalid_shells_are_not_human() {
+        assert!(!is_human(1000, "user", "/usr/sbin/nologin", 1000, None));
+        assert!(!is_human(1000, "user", "/bin/false", 1000, None));
+        assert!(!is_human(1000, "user", "", 1000, None));
+        assert!(!is_human(
+            1000,
+            "user",
+            "/opt/custom/shell",
+            1000,
+            Some(&shells())
+        ));
+        assert!(is_human(1000, "user", "/opt/custom/shell", 1000, None));
     }
 }
