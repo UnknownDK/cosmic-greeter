@@ -5,7 +5,6 @@ use cosmic_greeter_daemon::accounts;
 use futures_util::StreamExt;
 use std::time::Duration;
 use zbus::Connection;
-use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedObjectPath;
 use zbus_systemd::login1::{ManagerProxy, SessionProxy};
 
@@ -82,11 +81,7 @@ async fn greeter_session_user(
     connection: &Connection,
     path: OwnedObjectPath,
 ) -> zbus::Result<Option<String>> {
-    let session = SessionProxy::builder(connection)
-        .path(path)?
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await?;
+    let session = SessionProxy::new(connection, path).await?;
 
     // Skips the greeter itself (class "greeter") and SSH or other remote logins
     if session.service().await? != PAM_SERVICE

@@ -48,38 +48,6 @@ const EXCLUDED_USERNAMES: &[&str] = &[
     "cosmic-greeter",
 ];
 
-/// Decides whether an account belongs to a human, using the same rules as AccountsService.
-/// There is deliberately no upper UID bound: UID_MAX only limits the UIDs useradd allocates,
-/// while directory services (SSSD, winbind) map users to UIDs far above it.
-fn is_human(
-    uid: u32,
-    name: &str,
-    shell: &str,
-    uid_min: u32,
-    valid_shells: Option<&BTreeSet<String>>,
-) -> bool {
-    if EXCLUDED_USERNAMES.contains(&name) {
-        return false;
-    }
-
-    match Path::new(shell).file_name().and_then(|x| x.to_str()) {
-        // Skip empty shell
-        None => return false,
-        // Skip shell ending in false
-        Some("false") => return false,
-        // Skip shell ending in nologin
-        Some("nologin") => return false,
-        _ => {}
-    }
-
-    // Skip shells that are not listed in /etc/shells
-    if valid_shells.is_some_and(|shells| !shells.contains(shell)) {
-        return false;
-    }
-
-    uid >= uid_min
-}
-
 /// Reads /etc/passwd directly instead of enumerating NSS, so that directory services with
 /// enumeration enabled do not list every domain account.
 fn local_passwd_users() -> Vec<pwd::Passwd> {
@@ -121,7 +89,7 @@ pub async fn load_users() -> Vec<(pwd::Passwd, UserData)> {
         Err(err) => Err(err),
     };
 
-    // The pwd::Passwd methods are unsafe (but not labelled as such) due to using global state (libc pwent functions).
+    // The pwd::Passwd methods are unsafe (but not labelled as such) due to using global state (libc getpwnam and getpwuid).
     // To prevent issues, this should only be called once in the entire process space at a time
     let mut users = Vec::new();
     match accounts_users {
@@ -156,11 +124,11 @@ pub async fn load_users() -> Vec<(pwd::Passwd, UserData)> {
         }
     }
 
-    for uid in user_filter.homed_uids.iter() {
-        if users.iter().any(|(user, _)| user.uid == *uid) {
+    for &uid in &user_filter.homed_uids {
+        if users.iter().any(|(user, _)| user.uid == uid) {
             continue;
         }
-        if let Some(user) = pwd::Passwd::from_uid(*uid)
+        if let Some(user) = pwd::Passwd::from_uid(uid)
             && user_filter.filter(&user)
         {
             let user_data = UserData::from(&user);
@@ -228,20 +196,34 @@ impl UserFilter {
         }
     }
 
+    /// Decides whether an account belongs to a human, using the same rules as AccountsService.
+    /// There is deliberately no upper UID bound: UID_MAX only limits the UIDs useradd allocates,
+    /// while directory services (SSSD, winbind) map users to UIDs far above it.
     fn filter(&self, user: &pwd::Passwd) -> bool {
-        // systemd-homed allocates UIDs from its own range, which may be below UID_MIN
-        let uid_min = if self.homed_uids.contains(&user.uid) {
-            0
-        } else {
-            self.uid_min
-        };
-        is_human(
-            user.uid,
-            &user.name,
-            &user.shell,
-            uid_min,
-            self.valid_shells.as_ref(),
-        )
+        if EXCLUDED_USERNAMES.contains(&user.name.as_str()) {
+            return false;
+        }
+
+        match Path::new(&user.shell).file_name().and_then(|x| x.to_str()) {
+            // Skip empty shell
+            None => return false,
+            // Skip shell ending in false
+            Some("false") => return false,
+            // Skip shell ending in nologin
+            Some("nologin") => return false,
+            _ => {}
+        }
+
+        // Skip shells that are not listed in /etc/shells
+        if self
+            .valid_shells
+            .as_ref()
+            .is_some_and(|shells| !shells.contains(&user.shell))
+        {
+            return false;
+        }
+
+        user.uid >= self.uid_min
     }
 }
 
@@ -525,63 +507,59 @@ impl UserData {
 mod tests {
     use super::*;
 
-    fn shells() -> BTreeSet<String> {
-        ["/bin/sh", "/bin/bash", "/usr/bin/bash", "/usr/bin/fish"]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+    fn user_filter(valid_shells: Option<&[&str]>) -> UserFilter {
+        UserFilter {
+            uid_min: 1000,
+            valid_shells: valid_shells
+                .map(|shells| shells.iter().copied().map(str::to_string).collect()),
+            homed_uids: BTreeSet::new(),
+        }
+    }
+
+    fn user(uid: u32, name: &str, shell: &str) -> pwd::Passwd {
+        pwd::Passwd {
+            name: name.to_string(),
+            passwd: None,
+            uid,
+            gid: uid,
+            gecos: None,
+            dir: format!("/home/{name}"),
+            shell: shell.to_string(),
+        }
     }
 
     #[test]
-    fn domain_uids_above_uid_max_are_human() {
-        assert!(is_human(
-            1_234_500_001,
-            "jdoe@corp.example",
-            "/bin/bash",
-            1000,
-            Some(&shells())
-        ));
-        assert!(is_human(65_001, "jdoe", "/bin/bash", 1000, Some(&shells())));
+    fn domain_uids_above_uid_max_are_shown() {
+        let filter = user_filter(Some(&["/bin/bash"]));
+        assert!(filter.filter(&user(1_234_500_001, "jdoe@corp.example", "/bin/bash")));
+        assert!(filter.filter(&user(65_001, "jdoe", "/bin/bash")));
     }
 
     #[test]
-    fn uids_below_uid_min_are_not_human() {
-        assert!(!is_human(
-            999,
-            "service",
-            "/bin/bash",
-            1000,
-            Some(&shells())
-        ));
-        assert!(is_human(1000, "user", "/bin/bash", 1000, Some(&shells())));
+    fn uids_below_uid_min_are_hidden() {
+        let filter = user_filter(Some(&["/bin/bash"]));
+        assert!(!filter.filter(&user(999, "service", "/bin/bash")));
+        assert!(filter.filter(&user(1000, "user", "/bin/bash")));
     }
 
     #[test]
-    fn excluded_usernames_are_not_human() {
+    fn excluded_usernames_are_hidden() {
         // The overflow UID is no longer hidden by an upper UID bound
-        assert!(!is_human(
-            65_534,
-            "nobody",
-            "/bin/sh",
-            1000,
-            Some(&shells())
-        ));
-        assert!(!is_human(65_534, "nfsnobody", "/bin/sh", 1000, None));
-        assert!(!is_human(1001, "cosmic-greeter", "/bin/sh", 1000, None));
+        let filter = user_filter(None);
+        assert!(!filter.filter(&user(65_534, "nobody", "/bin/sh")));
+        assert!(!filter.filter(&user(65_534, "nfsnobody", "/bin/sh")));
+        assert!(!filter.filter(&user(1001, "cosmic-greeter", "/bin/sh")));
     }
 
     #[test]
-    fn invalid_shells_are_not_human() {
-        assert!(!is_human(1000, "user", "/usr/sbin/nologin", 1000, None));
-        assert!(!is_human(1000, "user", "/bin/false", 1000, None));
-        assert!(!is_human(1000, "user", "", 1000, None));
-        assert!(!is_human(
-            1000,
-            "user",
-            "/opt/custom/shell",
-            1000,
-            Some(&shells())
-        ));
-        assert!(is_human(1000, "user", "/opt/custom/shell", 1000, None));
+    fn invalid_shells_are_hidden() {
+        let filter = user_filter(None);
+        assert!(!filter.filter(&user(1000, "user", "/usr/sbin/nologin")));
+        assert!(!filter.filter(&user(1000, "user", "/bin/false")));
+        assert!(!filter.filter(&user(1000, "user", "")));
+        assert!(filter.filter(&user(1000, "user", "/opt/custom/shell")));
+
+        let filter = user_filter(Some(&["/bin/bash"]));
+        assert!(!filter.filter(&user(1000, "user", "/opt/custom/shell")));
     }
 }

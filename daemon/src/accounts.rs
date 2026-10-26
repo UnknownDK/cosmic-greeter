@@ -1,6 +1,6 @@
 //! Minimal client for the org.freedesktop.Accounts (AccountsService) D-Bus service.
 
-use zbus::{Connection, proxy, proxy::CacheProperties, zvariant::OwnedObjectPath};
+use zbus::{Connection, proxy, zvariant::OwnedObjectPath};
 
 #[proxy(
     interface = "org.freedesktop.Accounts",
@@ -66,11 +66,7 @@ pub async fn list_users(connection: &Connection) -> zbus::Result<Vec<User>> {
 
 /// Reads a user, returning `None` for users that should not be shown
 async fn read_user(connection: &Connection, path: OwnedObjectPath) -> zbus::Result<Option<User>> {
-    let user = AccountsUserProxy::builder(connection)
-        .path(path)?
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await?;
+    let user = AccountsUserProxy::new(connection, path).await?;
 
     // Same exclusions as the GNOME Shell login dialog
     if user.system_account().await? || user.locked().await? {
@@ -90,11 +86,7 @@ async fn read_user(connection: &Connection, path: OwnedObjectPath) -> zbus::Resu
 pub async fn cache_remote_user(connection: &Connection, name: &str) -> zbus::Result<bool> {
     let accounts = AccountsProxy::new(connection).await?;
     let path = accounts.find_user_by_name(name).await?;
-    let user = AccountsUserProxy::builder(connection)
-        .path(path)?
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await?;
+    let user = AccountsUserProxy::new(connection, path).await?;
 
     if user.local_account().await? || user.system_account().await? {
         return Ok(false);
