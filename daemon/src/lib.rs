@@ -223,7 +223,8 @@ impl UserFilter {
             return false;
         }
 
-        user.uid >= self.uid_min
+        // systemd-homed users may have any UID outside the system range, including below UID_MIN
+        user.uid >= self.uid_min || self.homed_uids.contains(&user.uid)
     }
 }
 
@@ -540,6 +541,19 @@ mod tests {
         let filter = user_filter(Some(&["/bin/bash"]));
         assert!(!filter.filter(&user(999, "service", "/bin/bash")));
         assert!(filter.filter(&user(1000, "user", "/bin/bash")));
+    }
+
+    #[test]
+    fn homed_users_below_uid_min_are_shown() {
+        let filter = UserFilter {
+            uid_min: 5000,
+            homed_uids: BTreeSet::from([2000]),
+            ..user_filter(Some(&["/bin/bash"]))
+        };
+        assert!(filter.filter(&user(2000, "homed", "/bin/bash")));
+        assert!(!filter.filter(&user(2001, "local", "/bin/bash")));
+        // The username and shell checks still apply
+        assert!(!filter.filter(&user(2000, "homed", "/usr/sbin/nologin")));
     }
 
     #[test]
