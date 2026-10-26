@@ -38,4 +38,5 @@ Architecture: amd64 arm64
 Depends:
     ${misc:Depends},
     ${shlibs:Depends}
+Recommends: accountsservice
 Description: Cosmic Greeter daemon

@@ -17,6 +17,7 @@ cosmic-theme.workspace = true
 tracing.workspace = true
 tracing-journald = { workspace = true, optional = true }
 color-eyre.workspace = true
+futures-util = { version = "0.3", optional = true }
 pwd.workspace = true
 ron.workspace = true
 serde.workspace = true
@@ -28,8 +29,8 @@ whitespace-conf = "1"
 #TODO: reduce features
 tokio = { workspace = true, features = ["full"] }
 xdg = "3.0"
-zbus_systemd = { version = "0.26000.0", features = ["home1"], optional = true }
+zbus_systemd = { version = "0.26000.0", features = ["home1", "login1"], optional = true }
 
 [features]
 default = ["systemd"]
-systemd = ["tracing-journald", "zbus_systemd"]
+systemd = ["tracing-journald", "zbus_systemd", "futures-util"]
