@@ -57,30 +57,40 @@ pub async fn list_users(connection: &Connection) -> zbus::Result<Vec<User>> {
 
     let mut users = Vec::new();
     for path in accounts.list_cached_users().await? {
-        let user = AccountsUserProxy::builder(connection)
-            .path(path)?
-            .cache_properties(CacheProperties::No)
-            .build()
-            .await?;
-
-        // Same exclusions as the GNOME Shell login dialog
-        if user.system_account().await? || user.locked().await? {
-            continue;
+        // A user may be removed while the list is read, so one failure must not drop the others
+        match read_user(connection, path.clone()).await {
+            Ok(Some(user)) => users.push(user),
+            Ok(None) => {}
+            Err(err) => tracing::warn!("failed to read AccountsService user {path:?}: {err:?}"),
         }
-
-        let Ok(uid) = u32::try_from(user.uid().await?) else {
-            continue;
-        };
-
-        users.push(User {
-            uid,
-            name: user.user_name().await?,
-            real_name: user.real_name().await?,
-            icon_file: user.icon_file().await?,
-        });
     }
 
     Ok(users)
+}
+
+/// Reads a user, returning `None` for users that should not be shown
+async fn read_user(connection: &Connection, path: OwnedObjectPath) -> zbus::Result<Option<User>> {
+    let user = AccountsUserProxy::builder(connection)
+        .path(path)?
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await?;
+
+    // Same exclusions as the GNOME Shell login dialog
+    if user.system_account().await? || user.locked().await? {
+        return Ok(None);
+    }
+
+    let Ok(uid) = u32::try_from(user.uid().await?) else {
+        return Ok(None);
+    };
+
+    Ok(Some(User {
+        uid,
+        name: user.user_name().await?,
+        real_name: user.real_name().await?,
+        icon_file: user.icon_file().await?,
+    }))
 }
 
 /// Caches a remote (e.g. LDAP, SSSD or AD) user so AccountsService keeps listing them after they

@@ -3,6 +3,7 @@
 
 use cosmic_greeter_daemon::accounts;
 use futures_util::StreamExt;
+use std::time::Duration;
 use zbus::Connection;
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedObjectPath;
@@ -11,12 +12,29 @@ use zbus_systemd::login1::{ManagerProxy, SessionProxy};
 /// PAM service greetd uses for user sessions, set in cosmic-greeter.toml
 const PAM_SERVICE: &str = "cosmic-greeter";
 
+const MIN_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
 //IMPORTANT: This task may run while run_as_user has switched the effective user of the process.
 // It must only talk over the existing D-Bus connection, whose credentials were recorded by the
 // bus when it connected as root, and must not use NSS (getpwnam is not thread safe).
 pub async fn run(connection: Connection) {
-    if let Err(err) = watch_sessions(&connection).await {
-        tracing::error!("failed to watch logind sessions: {err:?}");
+    // The daemon keeps running when watching fails, so systemd would not restart it: retry here
+    let mut backoff = MIN_BACKOFF;
+    loop {
+        match watch_sessions(&connection).await {
+            Ok(()) => {
+                tracing::warn!("logind session signals ended, watching again");
+                backoff = MIN_BACKOFF;
+            }
+            Err(err) => {
+                tracing::error!(
+                    "failed to watch logind sessions, retrying in {backoff:?}: {err:?}"
+                );
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
