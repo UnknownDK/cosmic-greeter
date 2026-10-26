@@ -77,7 +77,7 @@ pub fn main(user: pwd::Passwd) -> Result<(), Box<dyn std::error::Error>> {
 
     crate::localize::localize();
 
-    let mut user_data = UserData::from(user);
+    let mut user_data = UserData::from(&user);
     // We are already the user at this point
     user_data.load_config_as_user();
 

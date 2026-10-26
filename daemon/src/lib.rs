@@ -123,37 +123,38 @@ pub async fn load_users() -> Vec<(pwd::Passwd, UserData)> {
 
     // The pwd::Passwd methods are unsafe (but not labelled as such) due to using global state (libc pwent functions).
     // To prevent issues, this should only be called once in the entire process space at a time
-    let mut users: Vec<(pwd::Passwd, UserData)> = match accounts_users {
-        Ok(accounts_users) => accounts_users
-            .into_iter()
-            .filter_map(
-                |accounts_user| match pwd::Passwd::from_name(&accounts_user.name) {
-                    Ok(Some(user)) => {
-                        Some((user.clone(), UserData::from_accounts(user, accounts_user)))
-                    }
+    let mut users = Vec::new();
+    match accounts_users {
+        Ok(accounts_users) => {
+            for accounts_user in accounts_users {
+                let user = match pwd::Passwd::from_name(&accounts_user.name) {
+                    Ok(Some(user)) => user,
                     Ok(None) => {
                         tracing::warn!(
                             "user {:?} from AccountsService not found",
                             accounts_user.name
                         );
-                        None
+                        continue;
                     }
                     Err(err) => {
                         tracing::warn!("failed to look up user {:?}: {err:?}", accounts_user.name);
-                        None
+                        continue;
                     }
-                },
-            )
-            .collect(),
+                };
+                let user_data = UserData::from_accounts(&user, accounts_user);
+                users.push((user, user_data));
+            }
+        }
         Err(err) => {
             tracing::warn!("failed to list users from AccountsService, using /etc/passwd: {err:?}");
-            local_passwd_users()
-                .into_iter()
-                .filter(|user| user_filter.filter(user))
-                .map(|user| (user.clone(), UserData::from(user)))
-                .collect()
+            for user in local_passwd_users() {
+                if user_filter.filter(&user) {
+                    let user_data = UserData::from(&user);
+                    users.push((user, user_data));
+                }
+            }
         }
-    };
+    }
 
     for uid in user_filter.homed_uids.iter() {
         if users.iter().any(|(user, _)| user.uid == *uid) {
@@ -162,14 +163,15 @@ pub async fn load_users() -> Vec<(pwd::Passwd, UserData)> {
         if let Some(user) = pwd::Passwd::from_uid(*uid)
             && user_filter.filter(&user)
         {
-            users.push((user.clone(), UserData::from(user)));
+            let user_data = UserData::from(&user);
+            users.push((user, user_data));
         }
     }
 
     users
 }
 
-pub struct UserFilter {
+struct UserFilter {
     uid_min: u32,
     valid_shells: Option<BTreeSet<String>>,
     homed_uids: BTreeSet<u32>,
@@ -193,7 +195,7 @@ impl UserFilter {
         Ok(homed_uids)
     }
 
-    pub async fn new() -> Self {
+    async fn new() -> Self {
         let login_defs_data = fs::read_to_string("/etc/login.defs").unwrap_or_default();
         let login_defs = whitespace_conf::parse(&login_defs_data);
 
@@ -226,7 +228,7 @@ impl UserFilter {
         }
     }
 
-    pub fn filter(&self, user: &pwd::Passwd) -> bool {
+    fn filter(&self, user: &pwd::Passwd) -> bool {
         // systemd-homed allocates UIDs from its own range, which may be below UID_MIN
         let uid_min = if self.homed_uids.contains(&user.uid) {
             0
@@ -486,8 +488,8 @@ impl UserData {
     }
 }
 
-impl From<pwd::Passwd> for UserData {
-    fn from(user: pwd::Passwd) -> Self {
+impl From<&pwd::Passwd> for UserData {
+    fn from(user: &pwd::Passwd) -> Self {
         let mut full_name = user
             .gecos
             .as_ref()
@@ -507,7 +509,7 @@ impl From<pwd::Passwd> for UserData {
 }
 
 impl UserData {
-    fn from_accounts(user: pwd::Passwd, accounts_user: accounts::User) -> Self {
+    fn from_accounts(user: &pwd::Passwd, accounts_user: accounts::User) -> Self {
         let mut user_data = Self::from(user);
         if !accounts_user.real_name.is_empty() {
             user_data.full_name = accounts_user.real_name;

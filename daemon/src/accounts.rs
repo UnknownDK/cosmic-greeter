@@ -21,9 +21,6 @@ pub trait Accounts {
 )]
 pub trait AccountsUser {
     #[zbus(property)]
-    fn uid(&self) -> zbus::Result<u64>;
-
-    #[zbus(property)]
     fn user_name(&self) -> zbus::Result<String>;
 
     #[zbus(property)]
@@ -44,7 +41,6 @@ pub trait AccountsUser {
 
 #[derive(Clone, Debug)]
 pub struct User {
-    pub uid: u32,
     pub name: String,
     pub real_name: String,
     pub icon_file: String,
@@ -81,12 +77,7 @@ async fn read_user(connection: &Connection, path: OwnedObjectPath) -> zbus::Resu
         return Ok(None);
     }
 
-    let Ok(uid) = u32::try_from(user.uid().await?) else {
-        return Ok(None);
-    };
-
     Ok(Some(User {
-        uid,
         name: user.user_name().await?,
         real_name: user.real_name().await?,
         icon_file: user.icon_file().await?,
