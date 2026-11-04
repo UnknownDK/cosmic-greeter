@@ -10,6 +10,9 @@ use tracing_subscriber::{EnvFilter, fmt};
 use zbus::DBusError;
 use zbus::connection::Builder;
 
+#[cfg(feature = "systemd")]
+mod cache;
+
 //IMPORTANT: this function is critical to the security of this proxy. It must ensure that the
 // callback is executed with the permissions of the specified user id. A good test is to see if
 // the /etc/shadow file can be read with a non-root user, it should fail with EPERM.
@@ -133,11 +136,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .try_init()
         .wrap_err("failed to initialize logger")?;
 
+    #[cfg(feature = "systemd")]
+    let pam_service = cache::pam_service();
+
     let _conn = Builder::system()?
         .name("com.system76.CosmicGreeter")?
         .serve_at("/com/system76/CosmicGreeter", GreeterProxy)?
         .build()
         .await?;
+
+    #[cfg(feature = "systemd")]
+    tokio::spawn(cache::run(_conn.clone(), pam_service));
 
     pending::<()>().await;
 
