@@ -1,5 +1,7 @@
 [Unit]
 Description=COSMIC Greeter Daemon
+Wants=accounts-daemon.service
+After=accounts-daemon.service
 
 [Service]
 Type=dbus

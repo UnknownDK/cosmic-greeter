@@ -31,7 +31,7 @@ use cosmic::surface::action::{LiveSettings, app_layer_shell};
 use cosmic::widget::{id_container, text};
 use cosmic::{Element, executor, surface, theme, widget};
 use cosmic_greeter_config::Config as CosmicGreeterConfig;
-use cosmic_greeter_daemon::{UserData, UserFilter};
+use cosmic_greeter_daemon::UserData;
 use cosmic_randr_shell::{KdlParseWithError, List};
 use cosmic_settings_a11y_manager_subscription::{AccessibilityEvent, AccessibilityRequest};
 use greetd_ipc::Request;
@@ -65,30 +65,38 @@ static USERNAME_ID: LazyLock<iced::id::Id> = LazyLock::new(|| iced::id::Id::new(
 )]
 trait Greeter {
     async fn get_user_data(&self) -> Result<String, zbus::Error>;
+    async fn get_user_data_with_status(&self) -> Result<(String, bool), zbus::Error>;
 }
 
-async fn user_data_dbus() -> Result<Vec<UserData>, Box<dyn Error>> {
+async fn user_data_dbus() -> Result<(Vec<UserData>, bool), Box<dyn Error>> {
     let connection = Connection::system().await?;
 
     // `dbus_proxy` macro creates `MyGreaterProxy` based on `Notifications` trait.
     let proxy = GreeterProxy::new(&connection).await?;
-    let reply = proxy.get_user_data().await?;
+    let (reply, complete) = match proxy.get_user_data_with_status().await {
+        Ok(result) => result,
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+        {
+            (proxy.get_user_data().await?, false)
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     let user_datas: Vec<UserData> = ron::from_str(&reply)?;
-    Ok(user_datas)
+    Ok((user_datas, complete))
 }
 
-async fn user_data_fallback() -> Vec<UserData> {
-    let user_filter = UserFilter::new().await;
-
-    // The pwd::Passwd method is unsafe (but not labelled as such) due to using global state (libc pwent functions).
-    /* unsafe */
-    {
-        pwd::Passwd::iter()
-            .filter(|user| user_filter.filter(user))
-            .map(UserData::from)
-            .collect()
-    }
+async fn user_data_fallback() -> (Vec<UserData>, bool) {
+    let cosmic_greeter_daemon::LoadedUsers { users, complete } =
+        cosmic_greeter_daemon::load_users().await;
+    (
+        users
+            .into_iter()
+            .map(|(_, user_data, _)| user_data)
+            .collect(),
+        complete,
+    )
 }
 
 pub fn main() -> Result<(), Box<dyn Error>> {
@@ -127,7 +135,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         .enable_all()
         .build()
         .unwrap();
-    let mut user_datas = match runtime.block_on(user_data_dbus()) {
+    let (mut user_datas, user_list_complete) = match runtime.block_on(user_data_dbus()) {
         Ok(ok) => ok,
         Err(err) => {
             tracing::error!("failed to load user data from daemon: {}", err);
@@ -138,12 +146,13 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     // Sort user data by uid
     user_datas.sort_by(|a, b| a.uid.cmp(&b.uid));
     let (mut greeter_config, greeter_config_handler) = CosmicGreeterConfig::load();
-    // Filter out users that were removed from the system since the last time we loaded config
-    greeter_config.users.retain(|uid, _| {
-        user_datas
-            .binary_search_by(|probe| probe.uid.cmp(&uid.get()))
-            .is_ok()
-    });
+    if user_list_complete {
+        greeter_config.users.retain(|uid, _| {
+            user_datas
+                .binary_search_by(|probe| probe.uid.cmp(&uid.get()))
+                .is_ok()
+        });
+    }
 
     enum SessionType {
         X11,

@@ -1,5 +1,4 @@
 use color_eyre::eyre::Context;
-use cosmic_greeter_daemon::{UserData, UserFilter};
 use std::error::Error;
 use std::ffi::CString;
 use std::future::pending;
@@ -68,32 +67,37 @@ enum GreeterError {
 
 struct GreeterProxy;
 
-#[zbus::interface(name = "com.system76.CosmicGreeter")]
 impl GreeterProxy {
-    async fn get_user_data(&mut self) -> Result<String, GreeterError> {
-        let user_filter = UserFilter::new().await;
-
-        // The pwd::Passwd method is unsafe (but not labelled as such) due to using global state (libc pwent functions).
-        // To prevent issues, this should only be called once in the entire process space at a time
-        let users: Vec<_> = /* unsafe */ {
-             pwd::Passwd::iter()
-                .filter(|user| user_filter.filter(user))
-                .collect()
-            };
+    async fn user_data() -> Result<(String, bool), GreeterError> {
+        let cosmic_greeter_daemon::LoadedUsers { users, complete } =
+            cosmic_greeter_daemon::load_users().await;
 
         let mut user_datas = Vec::new();
-        for user in users {
-            let mut user_data = UserData::from(user.clone());
-
+        for (user, mut user_data, icon_file) in users {
             //IMPORTANT: Assume the identity of the user to ensure we don't read user file data as root
-            run_as_user(&user, || user_data.load_config_as_user())
-                .map_err(|err| GreeterError::RunAsUser(err.to_string()))?;
+            run_as_user(&user, || {
+                user_data.load_config_as_user_with_icon(icon_file.as_deref());
+            })
+            .map_err(|err| GreeterError::RunAsUser(err.to_string()))?;
 
             user_datas.push(user_data);
         }
 
         //TODO: is ron the best choice for passing around background data?
-        ron::to_string(&user_datas).map_err(|err| GreeterError::Ron(err.to_string()))
+        let user_datas =
+            ron::to_string(&user_datas).map_err(|err| GreeterError::Ron(err.to_string()))?;
+        Ok((user_datas, complete))
+    }
+}
+
+#[zbus::interface(name = "com.system76.CosmicGreeter")]
+impl GreeterProxy {
+    async fn get_user_data(&mut self) -> Result<String, GreeterError> {
+        Self::user_data().await.map(|(user_datas, _)| user_datas)
+    }
+
+    async fn get_user_data_with_status(&mut self) -> Result<(String, bool), GreeterError> {
+        Self::user_data().await
     }
 }
 
