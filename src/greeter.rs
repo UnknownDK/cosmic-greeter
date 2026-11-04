@@ -46,6 +46,7 @@ use std::{fs, io, process, thread};
 use tokio::process::Child;
 use tokio::time;
 use tracing::metadata::LevelFilter;
+#[cfg(feature = "systemd")]
 use tracing::warn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};

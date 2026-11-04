@@ -4,6 +4,7 @@ use std::ffi::CString;
 use std::future::pending;
 use std::{env, io};
 use tracing::metadata::LevelFilter;
+#[cfg(feature = "systemd")]
 use tracing::warn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -139,14 +140,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(feature = "systemd")]
     let pam_service = cache::pam_service();
 
-    let _conn = Builder::system()?
+    let conn = Builder::system()?
         .name("com.system76.CosmicGreeter")?
         .serve_at("/com/system76/CosmicGreeter", GreeterProxy)?
         .build()
         .await?;
 
     #[cfg(feature = "systemd")]
-    tokio::spawn(cache::run(_conn.clone(), pam_service));
+    tokio::spawn(cache::run(conn.clone(), pam_service));
+    #[cfg(not(feature = "systemd"))]
+    let _ = &conn;
 
     pending::<()>().await;
 

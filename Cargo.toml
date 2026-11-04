@@ -17,7 +17,7 @@ cosmic-bg-config.workspace = true
 cosmic-comp-config.workspace = true
 cosmic-config = { workspace = true, features = ["calloop", "macro"] }
 cosmic-greeter-config.workspace = true
-cosmic-greeter-daemon = { path = "daemon" }
+cosmic-greeter-daemon = { path = "daemon", default-features = false }
 cosmic-osk-config = { git = "https://github.com/pop-os/cosmic-osk" }
 dirs = "6"
 libcosmic = { workspace = true, features = [
@@ -98,7 +98,7 @@ features = ["tokio-codec"]
 [features]
 default = ["logind", "networkmanager", "upower", "systemd"]
 logind = ["logind-zbus", "systemd"]
-systemd = ["tracing-journald"]
+systemd = ["tracing-journald", "cosmic-greeter-daemon/systemd"]
 networkmanager = ["cosmic-dbus-networkmanager"]
 upower = ["upower_dbus"]
 

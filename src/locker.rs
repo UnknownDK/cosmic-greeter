@@ -29,6 +29,7 @@ use std::{env, fs, process};
 use tokio::sync::mpsc;
 use tokio::task;
 use tracing::level_filters::LevelFilter;
+#[cfg(feature = "systemd")]
 use tracing::warn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
